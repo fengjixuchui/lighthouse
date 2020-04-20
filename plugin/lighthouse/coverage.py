@@ -3,10 +3,11 @@ import time
 import logging
 import weakref
 import datetime
+import itertools
 import collections
 
 from lighthouse.util import *
-from lighthouse.palette import compute_color_on_gradiant
+from lighthouse.util.qt import compute_color_on_gradiant
 from lighthouse.metadata import DatabaseMetadata
 
 logger = logging.getLogger("Lighthouse.Coverage")
@@ -31,8 +32,6 @@ logger = logging.getLogger("Lighthouse.Coverage")
 #    able to rebuild mappings should the database structure (and its metadata)
 #    get updated or refreshed by the user.
 #
-
-BADADDR = 0xFFFFFFFFFFFFFFFF
 
 #------------------------------------------------------------------------------
 # Database Coverage
@@ -99,6 +98,7 @@ class DatabaseCoverage(object):
         #
 
         self._hitmap = build_hitmap(data)
+        self._imagebase = BADADDR
 
         #
         # the coverage hash is a simple hash of the coverage mask (hitmap keys)
@@ -166,6 +166,8 @@ class DatabaseCoverage(object):
         self.nodes = {}
         self.functions = {}
         self.instruction_percent = 0.0
+        self.partial_nodes = set()
+        self.partial_instructions = set()
 
         #
         # we instantiate a single weakref of ourself (the DatbaseCoverage
@@ -241,6 +243,48 @@ class DatabaseCoverage(object):
         Install a new databasee metadata object.
         """
         self._metadata = weakref.proxy(metadata)
+
+        #
+        # if the underlying database / metadata gets rebased, we will need to
+        # rebase our coverage data. the 'raw' coverage data stored in the
+        # hitmap is stored as absolute addresses for performance reasons
+        #
+        # here we compute the offset that we will need to rebase the coverage
+        # data by should a rebase have occurred
+        #
+
+        rebase_offset = self._metadata.imagebase - self._imagebase
+
+        #
+        # if the coverage's imagebase is still BADADDR, that means that this
+        # coverage object hasn't yet been mapped onto a given metadata cache.
+        #
+        # that's fine, we just need to initialize our imagebase which should
+        # (hopefully!) match the imagebase originally used when baking the
+        # coverage data into an absolute address form.
+        #
+
+        if self._imagebase == BADADDR:
+            self._imagebase = self._metadata.imagebase
+
+        #
+        # if the imagebase for this coverage exists, then it is susceptible to
+        # being rebased by a metadata update. if rebase_offset is non-zero,
+        # this is an indicator that a rebase has occurred.
+        #
+        # when a rebase occurs in the metadata, we must also rebase our
+        # coverage data (stored in the hitmap)
+        #
+
+        elif rebase_offset:
+            self._hitmap = { (address + rebase_offset): hits for address, hits in iteritems(self._hitmap) }
+            self._imagebase = self._metadata.imagebase
+
+        #
+        # since the metadata has been updated in one form or another, we need
+        # to trash our existing coverage mapping, and rebuild it from the data.
+        #
+
         self.unmap_all()
 
     def refresh(self):
@@ -260,6 +304,19 @@ class DatabaseCoverage(object):
         # dump the unmappable coverage data
         #self.dump_unmapped()
 
+    def refresh_theme(self):
+        """
+        Refresh UI facing elements to reflect the current theme.
+
+        Does not require @disassembler.execute_ui decorator as no Qt is touched.
+        """
+        for function in self.functions.values():
+            function.coverage_color = compute_color_on_gradiant(
+                function.instruction_percent,
+                self.palette.table_coverage_bad,
+                self.palette.table_coverage_good
+            )
+
     def _finalize(self, dirty_nodes, dirty_functions):
         """
         Finalize the DatabaseCoverage statistics / data for use.
@@ -272,8 +329,21 @@ class DatabaseCoverage(object):
         """
         Finalize the NodeCoverage objects statistics / data for use.
         """
-        for node_coverage in itervalues(dirty_nodes):
+        metadata = self._metadata
+        for address, node_coverage in iteritems(dirty_nodes):
             node_coverage.finalize()
+
+            # save off a reference to partially executed nodes
+            if node_coverage.instructions_executed != metadata.nodes[address].instruction_count:
+                self.partial_nodes.add(address)
+            else:
+                self.partial_nodes.discard(address)
+
+        # finalize the set of instructions executed in partially executed nodes
+        instructions = []
+        for node_address in self.partial_nodes:
+            instructions.append(self.nodes[node_address].executed_instructions)
+        self.partial_instructions = set(itertools.chain.from_iterable(instructions))
 
     def _finalize_functions(self, dirty_functions):
         """
@@ -470,9 +540,6 @@ class DatabaseCoverage(object):
                 node_coverage = NodeCoverage(node_metadata.address, self._weak_self)
                 self.nodes[node_metadata.address] = node_coverage
 
-            # compute the end address of the current basic block
-            node_end = node_metadata.address + node_metadata.size
-
             #
             # the loop below is as an inlined fast-path that assumes the next
             # several coverage addresses will likely belong to the same node
@@ -490,18 +557,8 @@ class DatabaseCoverage(object):
                 # discarding its address from the unmapped data list
                 #
 
-                if address in node_metadata.instructions:
-                    node_coverage.executed_instructions[address] = self._hitmap[address]
-                    self._unmapped_data.discard(address)
-
-                #
-                # if the given address allegedly falls within this node's
-                # address range, but doesn't line up with the known
-                # instructions, log it as 'misaligned' / suspicious
-                #
-
-                else:
-                    self._misaligned_data.add(address)
+                node_coverage.executed_instructions[address] = self._hitmap[address]
+                self._unmapped_data.discard(address)
 
                 # get the next address to attempt mapping on
                 try:
@@ -516,7 +573,7 @@ class DatabaseCoverage(object):
                 # of this loop and send it through the full node lookup path
                 #
 
-                if not (node_metadata.address <= address < node_end):
+                if not (address in node_metadata.instructions):
                     coverage_addresses.appendleft(address)
                     break
 
@@ -546,28 +603,31 @@ class DatabaseCoverage(object):
             # (parent) metadata.
             #
 
-            function_metadata = self._metadata.nodes[node_coverage.address].function
+            functions = self._metadata.get_functions_by_node(node_coverage.address)
 
             #
-            # now we will attempt to retrieve the the FunctionCoverage object
+            # now we will attempt to retrieve the FunctionCoverage objects
             # that we need to parent the given NodeCoverage object to
             #
 
-            function_coverage = self.functions.get(function_metadata.address, None)
+            for function_metadata in functions:
+                function_coverage = self.functions.get(function_metadata.address, None)
 
-            #
-            # if we failed to locate a FunctionCoverage for this node, it means
-            # that this is the first time we have seen coverage for this
-            # function. create a new coverage function object and use it now.
-            #
+                #
+                # if we failed to locate the FunctionCoverage for a function
+                # that references this node, then it is the first time we have
+                # seen coverage for it.
+                #
+                # create a new coverage function object and use it now.
+                #
 
-            if not function_coverage:
-                function_coverage = FunctionCoverage(function_metadata.address, self._weak_self)
-                self.functions[function_metadata.address] = function_coverage
+                if not function_coverage:
+                    function_coverage = FunctionCoverage(function_metadata.address, self._weak_self)
+                    self.functions[function_metadata.address] = function_coverage
 
-            # add the NodeCoverage object to its parent FunctionCoverage
-            function_coverage.mark_node(node_coverage)
-            dirty_functions[function_metadata.address] = function_coverage
+                # add the NodeCoverage object to its parent FunctionCoverage
+                function_coverage.mark_node(node_coverage)
+                dirty_functions[function_metadata.address] = function_coverage
 
         # done, return a map of FunctionCoverage objects that were modified
         return dirty_functions
@@ -576,11 +636,17 @@ class DatabaseCoverage(object):
         """
         Unmap all mapped coverage data.
         """
-        self._unmapped_data = set(self._hitmap.keys())
-        self._unmapped_data.add(BADADDR)
-        self._misaligned_data = set()
+
+        # clear out the processed / computed coverage data structures
         self.nodes = {}
         self.functions = {}
+        self.partial_nodes = set()
+        self.partial_instructions = set()
+        self._misaligned_data = set()
+
+        # dump the source coverage data back into an 'unmapped' state
+        self._unmapped_data = set(self._hitmap.keys())
+        self._unmapped_data.add(BADADDR)
 
     #--------------------------------------------------------------------------
     # Debug
@@ -590,7 +656,11 @@ class DatabaseCoverage(object):
         """
         Dump the unmapped coverage data.
         """
-        lmsg("Unmapped Coverage:")
+        lmsg("Unmapped coverage data for %s:" % self.name)
+        if len(self._unmapped_data) == 1: # 1 is going to be BADADDR
+            lmsg(" * (there is no unmapped data!)")
+            return
+
         for address in self._unmapped_data:
             lmsg(" * 0x%X" % address)
 
@@ -681,8 +751,8 @@ class FunctionCoverage(object):
         # bake colors
         self.coverage_color = compute_color_on_gradiant(
             self.instruction_percent,
-            self.database.palette.coverage_bad,
-            self.database.palette.coverage_good
+            self.database.palette.table_coverage_bad,
+            self.database.palette.table_coverage_good
         )
 
 #------------------------------------------------------------------------------
@@ -698,6 +768,7 @@ class NodeCoverage(object):
         self.database = database
         self.address = node_address
         self.executed_instructions = {}
+        self.instructions_executed = 0
 
     #--------------------------------------------------------------------------
     # Properties
@@ -709,13 +780,6 @@ class NodeCoverage(object):
         Return the number of instruction executions in this node.
         """
         return sum(itervalues(self.executed_instructions))
-
-    @property
-    def instructions_executed(self):
-        """
-        Return the number of unique instructions executed in this node.
-        """
-        return len(self.executed_instructions)
 
     #--------------------------------------------------------------------------
     # Controls
@@ -729,3 +793,6 @@ class NodeCoverage(object):
 
         # the estimated number of executions this node has experienced.
         self.executions = float(self.hits) / node_metadata.instruction_count
+
+        # the number of unique instructions executed
+        self.instructions_executed = len(self.executed_instructions)

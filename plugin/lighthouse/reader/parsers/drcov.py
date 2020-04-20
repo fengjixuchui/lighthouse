@@ -4,13 +4,21 @@ import re
 import sys
 import mmap
 import struct
+import collections
 from ctypes import *
+
+#
+# I know people like to use this parser in their own projects, so this
+# if/def makes it compatible with being imported or used outside Lighthouse
+#
 
 try:
     from lighthouse.exceptions import CoverageMissingError
     from lighthouse.reader.coverage_file import CoverageFile
+    g_lighthouse = True
 except ImportError as e:
     CoverageFile = object
+    g_lighthouse = False
 
 #------------------------------------------------------------------------------
 # DynamoRIO Drcov Log Parser
@@ -39,7 +47,10 @@ class DrcovData(CoverageFile):
         self.bb_table_is_binary = True
 
         # parse
-        super(DrcovData, self).__init__(filepath)
+        if g_lighthouse:
+            super(DrcovData, self).__init__(filepath)
+        else:
+            self._parse()
 
     #--------------------------------------------------------------------------
     # Public
@@ -49,16 +60,26 @@ class DrcovData(CoverageFile):
         """
         Return coverage data as basic block offsets for the named module.
         """
-        try:
-            module = self.modules[module_name]
-        except KeyError:
+        modules = self.modules.get(module_name, [])
+        if not modules:
             return []
 
-        # extract module id for speed
-        mod_id = module.id
+        #
+        # I don't know if this should ever actually trigger, but if it does,
+        # it is a strange testcase to collect coverage against. It means that
+        # maybe the target library/module was loaded, unloaded, and reloaded?
+        #
+        # if someone ever actally triggers this, we can look into it :S
+        #
 
-        # loop through the coverage data and filter out data for only this module
-        coverage_blocks = [bb.start for bb in self.bbs if bb.mod_id == mod_id]
+        if self.version > 2:
+            assert all(module.containing_id == modules[0].id for module in modules)
+
+        # extract the unique module ids that we need to collect blocks for
+        mod_ids = [module.id for module in modules]
+
+        # loop through the coverage data and filter out data for the target ids
+        coverage_blocks = [bb.start for bb in self.bbs if bb.mod_id in mod_ids]
 
         # return the filtered coverage blocks
         return coverage_blocks
@@ -67,16 +88,19 @@ class DrcovData(CoverageFile):
         """
         Return coverage data as basic blocks (offset, size) for the named module.
         """
-        try:
-            module = self.modules[module_name]
-        except KeyError:
+        modules = self.modules.get(module_name, [])
+        if not modules:
             return []
 
-        # extract module id for speed
-        mod_id = module.id
+        # NOTE: see comment in get_offsets() for more info...
+        if self.version > 2:
+            assert all(module.containing_id == modules[0].id for module in modules)
 
-        # loop through the coverage data and filter out data for only this module
-        coverage_blocks = [(bb.start, bb.size) for bb in self.bbs if bb.mod_id == mod_id]
+        # extract the unique module ids that we need to collect blocks for
+        mod_ids = [module.id for module in modules]
+
+        # loop through the coverage data and filter out data for the target ids
+        coverage_blocks = [(bb.start, bb.size) for bb in self.bbs if bb.mod_id in mod_ids]
 
         # return the filtered coverage blocks
         return coverage_blocks
@@ -224,21 +248,14 @@ class DrcovData(CoverageFile):
         """
         Parse drcov log modules in the module table from filestream.
         """
+        modules = collections.defaultdict(list)
 
         # loop through each *expected* line in the module table and parse it
         for i in range(self.module_table_count):
             module = DrcovModule(f.readline().decode('utf-8').strip(), self.module_table_version)
+            modules[module.filename].append(module)
 
-            # try to handle module name collisions...
-            if module.filename in self.modules:
-                public_name = module.filename + "_" + str(i)
-            else:
-                public_name = module.filename
-
-            assert not (public_name in self.modules), "Stop doing weird stuff."
-
-            # save the parsed module
-            self.modules[public_name] = module
+        self.modules = modules
 
     def _parse_bb_table(self, f):
         """
@@ -298,7 +315,7 @@ class DrcovData(CoverageFile):
             if text_entry != "module id, start, size:":
                 raise ValueError("Invalid BB header: %r" % text_entry)
 
-            pattern = re.compile(r"^module\[\s*(?P<mod>[0-9]+)\]\:\s*(?P<start>0x[0-9a-f]+)\,\s*(?P<size>[0-9]+)$")
+            pattern = re.compile(r"^module\[\s*(?P<mod>[0-9]+)\]\:\s*(?P<start>0x[0-9a-fA-F]+)\,\s*(?P<size>[0-9]+)$")
             for bb in self.bbs:
                 text_entry = f.readline().decode('utf-8').strip()
 

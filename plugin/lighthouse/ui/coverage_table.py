@@ -35,6 +35,30 @@ class CoverageTableView(QtWidgets.QTableView):
 
         # configure the widget for use
         self._ui_init()
+        self.refresh_theme()
+
+    @disassembler.execute_ui
+    def refresh_theme(self):
+        """
+        Refresh UI facing elements to reflect the current theme.
+        """
+        palette = self._model.lctx.palette
+        self.setStyleSheet(
+            "QTableView {"
+            "  gridline-color: %s;" % palette.table_grid.name() +
+            "  background-color: %s;" % palette.table_background.name() +
+            "  color: %s;" % palette.table_text.name() +
+            "  outline: none; "
+            "} " +
+            "QHeaderView::section { "
+            "  padding: 1ex;"  \
+            "  margin: 0;"  \
+            "} " +
+            "QTableView::item:selected {"
+            "  color: white; "
+            "  background-color: %s;" % palette.table_selection.name() +
+            "}"
+        )
 
     #--------------------------------------------------------------------------
     # QTableView Overloads
@@ -84,23 +108,8 @@ class CoverageTableView(QtWidgets.QTableView):
         """
         Initialize the coverage table.
         """
-        palette = self._model._director._palette
         self.setFocusPolicy(QtCore.Qt.StrongFocus)
         self.setHorizontalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
-
-        # widget style
-        self.setStyleSheet(
-            "QTableView {"
-            "  gridline-color: black;"
-            "  background-color: %s;" % palette.overview_bg.name() +
-            #"  color: %s;" % palette.combobox_fg.name() +
-            "  outline: none; "
-            "} " +
-            "QTableView::item:selected {"
-            "  color: white; "
-            "  background-color: %s;" % palette.selection.name() +
-            "}"
-        )
 
         # these properties will allow the user shrink the table to any size
         self.setMinimumHeight(0)
@@ -123,23 +132,8 @@ class CoverageTableView(QtWidgets.QTableView):
 
         # set the initial column widths based on their title or contents
         for i in xrange(self._model.columnCount()):
-
-            # determine the pixel width of the column header text
-            title_text = self._model.headerData(i, QtCore.Qt.Horizontal)
-            title_rect = title_fm.boundingRect(title_text)
-
-            # determine the pixel width of sample column entry text
-            entry_text = self._model.SAMPLE_CONTENTS[i]
-            entry_rect = entry_fm.boundingRect(entry_text)
-
-            # select the lager of the two potential column widths
-            column_width = max(title_rect.width(), entry_rect.width())
-
-            # pad the final column width to make the table less dense
-            column_width = int(column_width * 1.2)
-
-            # save the final column width
-            self.setColumnWidth(i, column_width)
+            title_rect = self._model.headerData(i, QtCore.Qt.Horizontal, QtCore.Qt.SizeHintRole)
+            self.setColumnWidth(i, title_rect.width())
 
         #
         # Misc
@@ -156,7 +150,9 @@ class CoverageTableView(QtWidgets.QTableView):
         vh.hide()
 
         # stretch last table column (which is blank) to fill remaining space
-        hh.setStretchLastSection(True)
+        #hh.setStretchLastSection(True)
+        #hh.setCascadingSectionResizes(True)
+        hh.setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
 
         # disable bolding of table column headers when table is selected
         hh.setHighlightSections(False)
@@ -174,15 +170,7 @@ class CoverageTableView(QtWidgets.QTableView):
         #
 
         # force the table row heights to be fixed height
-        if USING_PYQT5:
-            vh.setSectionResizeMode(QtWidgets.QHeaderView.Fixed)
-        else:
-            vh.setResizeMode(QtWidgets.QHeaderView.Fixed)
-
-        # specify the fixed pixel height for the table headers
-        spacing = title_fm.height() - title_fm.xHeight()
-        tweak = 26*get_dpi_scale() - spacing
-        hh.setFixedHeight(entry_fm.height()+tweak)
+        vh.setSectionResizeMode(QtWidgets.QHeaderView.Fixed)
 
         # specify the fixed pixel height for the table rows
         # NOTE: don't ask too many questions about this voodoo math :D
@@ -409,7 +397,8 @@ class CoverageTableController(object):
     The Coverage Table Controller (Logic)
     """
 
-    def __init__(self, model):
+    def __init__(self, lctx, model):
+        self.lctx = lctx
         self._model = model
         self._last_directory = None
 
@@ -425,7 +414,7 @@ class CoverageTableController(object):
 
         # retrieve details about the function targeted for rename
         function_address = self._model.row2func[row]
-        original_name = disassembler.get_function_raw_name_at(function_address)
+        original_name = disassembler[self.lctx].get_function_raw_name_at(function_address)
 
         # prompt the user for a new function name
         ok, new_name = prompt_string(
@@ -443,7 +432,7 @@ class CoverageTableController(object):
             return
 
         # rename the function
-        disassembler.set_function_name_at(function_address, new_name)
+        disassembler[self.lctx].set_function_name_at(function_address, new_name)
 
     @mainthread
     def prefix_table_functions(self, rows):
@@ -464,7 +453,7 @@ class CoverageTableController(object):
 
         # apply the user prefix to the functions depicted in the given rows
         function_addresses = self._get_function_addresses(rows)
-        disassembler.prefix_functions(function_addresses, prefix)
+        disassembler[self.lctx].prefix_functions(function_addresses, prefix)
 
     @mainthread
     def clear_function_prefixes(self, rows):
@@ -472,7 +461,7 @@ class CoverageTableController(object):
         Clear prefixes of database functions via the coverage table.
         """
         function_addresses = self._get_function_addresses(rows)
-        disassembler.clear_prefixes(function_addresses)
+        disassembler[self.lctx].clear_prefixes(function_addresses)
 
     #---------------------------------------------------------------------------
     # Copy-to-Clipboard
@@ -531,7 +520,32 @@ class CoverageTableController(object):
         """
         Navigate to the function depicted by the given row.
         """
-        disassembler.navigate(self._model.row2func[row])
+
+        # get the clicked function address
+        function_address = self._model.row2func[row]
+
+        #
+        # if there is actually coverage in the function, attempt to locate the
+        # first block (or any block) with coverage and set that as our target
+        #
+
+        function_coverage = self.lctx.director.coverage.functions.get(function_address, None)
+        if function_coverage:
+            if function_address in function_coverage.nodes:
+                target_address = function_address
+            else:
+                target_address = sorted(function_coverage.nodes)[0]
+
+        #
+        # if the user clicked a function with no coverage, we should just
+        # navigate to the top of the function... nothing fancy
+        #
+
+        else:
+            target_address = function_address
+
+        # navigate to the target function + block
+        disassembler[self.lctx].navigate_to_function(function_address, target_address)
 
     def toggle_column_alignment(self, column):
         """
@@ -542,36 +556,22 @@ class CoverageTableController(object):
 
         # toggle the column alignment between center (default) and left
         if alignment == QtCore.Qt.AlignCenter:
-            new_alignment = QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter
+            new_alignment = QtCore.Qt.AlignVCenter
         else:
             new_alignment = QtCore.Qt.AlignCenter
 
         # send the new alignment to the model
         self._model.set_column_alignment(column, new_alignment)
 
-    def refresh_metadata(self):
-        """
-        Hard refresh of the director and table metadata layers.
-        """
-        disassembler.show_wait_box("Building database metadata...")
-        self._model._director.refresh()
-
-        # ensure the table's model gets refreshed
-        disassembler.replace_wait_box("Refreshing Coverage Overview...")
-        self._model.refresh()
-
-        # all done
-        disassembler.hide_wait_box()
-
     def export_to_html(self):
         """
         Export the coverage table to an HTML report.
         """
         if not self._last_directory:
-            self._last_directory = disassembler.get_database_directory()
+            self._last_directory = disassembler[self.lctx].get_database_directory()
 
         # build filename for the coverage report based off the coverage name
-        name, _ = os.path.splitext(self._model._director.coverage_name)
+        name, _ = os.path.splitext(self.lctx.director.coverage_name)
         filename = name + ".html"
         suggested_filepath = os.path.join(self._last_directory, filename)
 
@@ -584,7 +584,7 @@ class CoverageTableController(object):
         {
             "filter": "HTML Files (*.html)",
             "caption": "Save HTML Report",
-            "directory" if USING_PYQT5 else "dir": suggested_filepath
+            "directory": suggested_filepath
         }
 
         # prompt the user with the file dialog, and await their chosen filename(s)
@@ -596,7 +596,7 @@ class CoverageTableController(object):
         self._last_directory = os.path.dirname(filename) + os.sep
 
         # write the generated HTML report to disk
-        with open(filename, "wb") as fd:
+        with open(filename, "w") as fd:
             fd.write(self._model.to_html())
 
         lmsg("Saved HTML report to %s" % filename)
@@ -632,7 +632,6 @@ class CoverageTableModel(QtCore.QAbstractTableModel):
     INST_HIT     = 4
     FUNC_SIZE    = 5
     COMPLEXITY   = 6
-    FINAL_COLUMN = 7
 
     METADATA_ATTRIBUTES = [FUNC_NAME, FUNC_ADDR, FUNC_SIZE, COMPLEXITY]
     COVERAGE_ATTRIBUTES = [COV_PERCENT, BLOCKS_HIT, INST_HIT]
@@ -652,32 +651,43 @@ class CoverageTableModel(QtCore.QAbstractTableModel):
     # column headers of the table
     COLUMN_HEADERS = \
     {
-        COV_PERCENT:  "Coverage %",
-        FUNC_NAME:    "Function Name",
+        COV_PERCENT:  "Cov %",
+        FUNC_NAME:    "Func Name",
         FUNC_ADDR:    "Address",
         BLOCKS_HIT:   "Blocks Hit",
-        INST_HIT:     "Instructions Hit",
-        FUNC_SIZE:    "Function Size",
-        COMPLEXITY:   "Complexity",
-        FINAL_COLUMN: ""
+        INST_HIT:     "Instr. Hit",
+        FUNC_SIZE:    "Func Size",
+        COMPLEXITY:   "CC",
+    }
+
+    # column header tooltips
+    COLUMN_TOOLTIPS = \
+    {
+        COV_PERCENT:  "Coverage Percent",
+        FUNC_NAME:    "Function Name",
+        FUNC_ADDR:    "Function Address",
+        BLOCKS_HIT:   "Number of Basic Blocks Executed",
+        INST_HIT:     "Number of Instructions Executed",
+        FUNC_SIZE:    "Function Size (bytes)",
+        COMPLEXITY:   "Cyclomatic Complexity",
     }
 
     # sample column
     SAMPLE_CONTENTS = \
     [
-        " 100.00% ",
+        " 100.00 ",
         " sub_140001B20 ",
         " 0x140001b20 ",
         " 100 / 100 ",
         " 1000 / 1000 ",
-        " 10000000 ",
-        " 1000000 ",
-        ""
+        " 100000 ",
+        " 1000 ",
     ]
 
-    def __init__(self, director, parent=None):
+    def __init__(self, lctx, parent=None):
         super(CoverageTableModel, self).__init__(parent)
-        self._director = director
+        self.lctx = lctx
+        self._director = lctx.director
 
         # convenience mapping from row_number --> function_address
         self.row2func = {}
@@ -690,13 +700,16 @@ class CoverageTableModel(QtCore.QAbstractTableModel):
 
         # a fallback coverage object for functions with no coverage
         self._blank_coverage = FunctionCoverage(BADADDR)
-        self._blank_coverage.coverage_color = director._palette.coverage_none
+        self._blank_coverage.coverage_color = lctx.palette.table_coverage_none
 
         # set the default column text alignment for each column (centered)
         self._default_alignment = QtCore.Qt.AlignCenter
         self._column_alignment = [
             self._default_alignment for x in self.COLUMN_HEADERS
         ]
+
+        # make the function name column left aligned by default
+        self.set_column_alignment(self.FUNC_NAME, QtCore.Qt.AlignVCenter)
 
         # initialize a monospace font to use for table row / cell text
         self._entry_font = MonospaceFont()
@@ -734,6 +747,15 @@ class CoverageTableModel(QtCore.QAbstractTableModel):
         self._director.coverage_modified(self._internal_refresh)
         self._director.metadata.function_renamed(self._data_changed)
 
+    def refresh_theme(self):
+        """
+        Refresh UI facing elements to reflect the current theme.
+
+        Does not require @disassembler.execute_ui decorator, data_changed() has its own.
+        """
+        self._blank_coverage.coverage_color = self.lctx.palette.table_coverage_none
+        self._data_changed()
+
     #--------------------------------------------------------------------------
     # QAbstractTableModel Overloads
     #--------------------------------------------------------------------------
@@ -770,9 +792,20 @@ class CoverageTableModel(QtCore.QAbstractTableModel):
                 # center align all columns
                 return self._column_alignment[column]
 
+            # tooltip request
+            elif role == QtCore.Qt.ToolTipRole:
+                return self.COLUMN_TOOLTIPS[column]
+
             # font format request
             elif role == QtCore.Qt.FontRole:
                 return self._title_font
+
+        if role == QtCore.Qt.SizeHintRole:
+            title_fm = QtGui.QFontMetricsF(self._title_font)
+            #title_rect = title_fm.boundingRect(self.COLUMN_HEADERS[column])
+            title_rect = title_fm.boundingRect(self.SAMPLE_CONTENTS[column])
+            padded = QtCore.QSize(int(title_rect.width()*1.45), int(title_rect.height()*1.75))
+            return padded
 
         # unhandeled header request
         return None
@@ -791,7 +824,7 @@ class CoverageTableModel(QtCore.QAbstractTableModel):
             # lookup the function info for this row
             try:
                 function_address  = self.row2func[index.row()]
-                function_metadata = self._director.metadata.functions[function_address]
+                function_metadata = self.lctx.metadata.functions[function_address]
 
             #
             # if we hit a KeyError, it is probably because the database metadata
@@ -861,10 +894,6 @@ class CoverageTableModel(QtCore.QAbstractTableModel):
             )
             return function_coverage.coverage_color
 
-        # cell text color request
-        elif role == QtCore.Qt.ForegroundRole:
-            return QtGui.QColor(QtCore.Qt.white)
-
         # cell font style format request
         elif role == QtCore.Qt.FontRole:
             return self._entry_font
@@ -895,7 +924,7 @@ class CoverageTableModel(QtCore.QAbstractTableModel):
 
         # column has not been enlightened to sorting
         except KeyError as e:
-            logger.warning("TODO/FUTURE: implement column %u sorting?" % column)
+            logger.error("ERROR: Sorting not implemented for column %u" % column)
             self.layoutChanged.emit()
             return
 
@@ -997,6 +1026,7 @@ class CoverageTableModel(QtCore.QAbstractTableModel):
         """
         Generate an HTML representation of the coverage table.
         """
+        palette = self.lctx.palette
 
         # table summary
         summary_html, summary_css = self._generate_html_summary()
@@ -1009,13 +1039,16 @@ class CoverageTableModel(QtCore.QAbstractTableModel):
         body_html = "<body>%s</body>" % '\n'.join(body_elements)
         body_css = \
         """
-        body {
+        body {{
             font-family: Arial, Helvetica, sans-serif;
 
-            color: white;
-            background-color: #363636;
-        }
-        """
+            color: {page_fg};
+            background-color: {page_bg};
+        }}
+        """.format(
+            page_fg=palette.table_text.name(),
+            page_bg=palette.html_page_background.name()
+        )
 
         # HTML <head> tag
         css_elements = [body_css, summary_css, table_css]
@@ -1033,6 +1066,7 @@ class CoverageTableModel(QtCore.QAbstractTableModel):
         """
         Generate the HTML table summary.
         """
+        palette = self.lctx.palette
         metadata = self._director.metadata
         coverage = self._director.coverage
 
@@ -1055,9 +1089,17 @@ class CoverageTableModel(QtCore.QAbstractTableModel):
         list_html = "<ul>%s</ul>" % '\n'.join(details)
         list_css = \
         """
-        .detail { font-weight: bold; color: white; }
-        li { color: #c0c0c0; }
-        """
+        .detail {{
+            font-weight: bold;
+            color: {page_fg};
+        }}
+        li {{
+            color: {detail_fg};
+        }}
+        """.format(
+            page_fg=palette.table_text.name(),
+            detail_fg=palette.html_summary_text.name()
+        )
 
         # title + summary
         summary_html = title_html + list_html
@@ -1068,7 +1110,7 @@ class CoverageTableModel(QtCore.QAbstractTableModel):
         """
         Generate the HTML coverage table.
         """
-        palette = self._director._palette
+        palette = self.lctx.palette
         table_rows = []
 
         # generate the table's column title row
@@ -1077,7 +1119,7 @@ class CoverageTableModel(QtCore.QAbstractTableModel):
             header_cells.append(
                 "<th>%s</th>" % self.headerData(i, QtCore.Qt.Horizontal)
             )
-        table_rows.append(("#505050", header_cells))
+        table_rows.append((palette.html_table_header.name(), header_cells))
 
         # generate the table's coverage rows
         for row in xrange(self.rowCount()):
@@ -1125,8 +1167,8 @@ class CoverageTableModel(QtCore.QAbstractTableModel):
             padding: 1ex 1em 1ex 1em;
         }}
         """.format(
-            table_bg=palette.overview_bg.name(),
-            table_fg="white"
+            table_bg=palette.table_background.name(),
+            table_fg=palette.table_text.name()
         )
 
         return (table_html, table_css)

@@ -1,3 +1,4 @@
+import os
 import time
 import string
 import logging
@@ -6,10 +7,12 @@ import traceback
 import collections
 
 from lighthouse.util.misc import *
+from lighthouse.util.debug import *
 from lighthouse.util.python import *
-from lighthouse.util.qt import await_future, await_lock, color_text
+from lighthouse.util.qt import await_future, await_lock, flush_qt_events
 from lighthouse.util.disassembler import disassembler
 
+from lighthouse.ui import ModuleSelector
 from lighthouse.reader import CoverageReader
 from lighthouse.metadata import DatabaseMetadata, metadata_progress
 from lighthouse.coverage import DatabaseCoverage
@@ -55,7 +58,7 @@ class CoverageDirector(object):
         self.metadata = metadata
 
         # the plugin color palette
-        self._palette = palette
+        self.palette = palette
 
         #----------------------------------------------------------------------
         # Coverage
@@ -63,6 +66,7 @@ class CoverageDirector(object):
 
         # the coverage file parser
         self.reader = CoverageReader()
+        self._target_whitelist = []
 
         # the name of the active coverage
         self.coverage_name = NEW_COMPOSITION
@@ -70,7 +74,14 @@ class CoverageDirector(object):
         # a map of loaded or composed database coverages
         self._database_coverage = collections.OrderedDict()
 
-        # TODO
+        #
+        # the owners map is used in block/coverage blame operations. it
+        # contains the mapping of node_address --> [ coverage filepaths ]
+        #
+        # given any node (basic block) address, we can use this mapping to do
+        # a reverse lookup to find which loaded coverage sets hit the block.
+        #
+
         self.owners = collections.defaultdict(set)
 
         #
@@ -178,7 +189,6 @@ class CoverageDirector(object):
             target=self._async_evaluate_ast,
             name="EvaluateAST"
         )
-        self._composition_worker.start()
 
         #----------------------------------------------------------------------
         # Callbacks
@@ -200,12 +210,37 @@ class CoverageDirector(object):
         self._coverage_created_callbacks  = []
         self._coverage_deleted_callbacks  = []
 
+        # director callbacks
+        self._refreshed_callbacks  = []
+
+    #--------------------------------------------------------------------------
+    # Subsystem Lifetime
+    #--------------------------------------------------------------------------
+
+    def start(self):
+        """
+        Start the metadata subsystem.
+        """
+        self._composition_worker.start()
+
     def terminate(self):
         """
         Cleanup & terminate the director.
         """
         self._ast_queue.put(None)
-        self._composition_worker.join()
+        try:
+            self._composition_worker.join()
+        except RuntimeError:
+            pass
+
+        # best effort to free up resources & improve interpreter spindown
+        del self._special_coverage
+        del self._database_coverage
+        del self._coverage_switched_callbacks
+        del self._coverage_modified_callbacks
+        del self._coverage_created_callbacks
+        del self._coverage_deleted_callbacks
+        del self._composition_cache
 
     #--------------------------------------------------------------------------
     # Properties
@@ -283,8 +318,6 @@ class CoverageDirector(object):
     def _notify_coverage_created(self):
         """
         Notify listeners of a coverage creation event.
-
-        TODO/FUTURE: send list of names created?
         """
         notify_callback(self._coverage_created_callbacks)
 
@@ -297,10 +330,20 @@ class CoverageDirector(object):
     def _notify_coverage_deleted(self):
         """
         Notify listeners of a coverage deletion event.
-
-        TODO/FUTURE: send list of names deleted?
         """
         notify_callback(self._coverage_deleted_callbacks)
+
+    def refreshed(self, callback):
+        """
+        Subscribe a callback for director refresh events.
+        """
+        register_callback(self._refreshed_callbacks, callback)
+
+    def _notify_refreshed(self):
+        """
+        Notify listeners of a director refresh event.
+        """
+        notify_callback(self._refreshed_callbacks)
 
     #----------------------------------------------------------------------
     # Batch Loading
@@ -334,7 +377,7 @@ class CoverageDirector(object):
 
         Returns a tuple of (coverage, errors)
         """
-        errors = []
+        errors = collections.defaultdict(list)
         aggregate_addresses = set()
 
         start = time.time()
@@ -351,12 +394,12 @@ class CoverageDirector(object):
 
             # save and suppress warnings generated from loading coverage files
             except CoverageParsingError as e:
-                errors.append(e)
+                errors[CoverageParsingError].append(e)
                 continue
 
             # ensure some data was actually extracted from the log
             if not coverage_addresses:
-                errors.append(CoverageMissingError(filepath))
+                errors[CoverageMissingError].append(CoverageMissingError(filepath))
                 continue
 
             # save the attribution data for this coverage data
@@ -376,9 +419,9 @@ class CoverageDirector(object):
 
         # evaluate coverage
         if not coverage.nodes:
-            errors.append(CoverageMappingAbsent(coverage))
+            errors[CoverageMappingAbsent].append(CoverageMappingAbsent(coverage))
         elif coverage.suspicious:
-            errors.append(CoverageMappingSuspicious(coverage))
+            errors[CoverageMappingSuspicious].append(CoverageMappingSuspicious(coverage))
 
         #----------------------------------------------------------------------
         end = time.time()
@@ -393,7 +436,7 @@ class CoverageDirector(object):
 
         Returns a tuple of (created_coverage, errors)
         """
-        errors = []
+        errors = collections.defaultdict(list)
         all_coverage = []
 
         start = time.time()
@@ -426,12 +469,12 @@ class CoverageDirector(object):
 
             # save and suppress warnings generated from loading coverage files
             except CoverageParsingError as e:
-                errors.append(e)
+                errors[CoverageParsingError].append(e)
                 continue
 
             # ensure some data was actually extracted from the log
             if not coverage_addresses:
-                errors.append(CoverageMissingError(filepath))
+                errors[CoverageMissingError].append(CoverageMissingError(filepath))
                 continue
 
             # save the attribution data for this coverage data
@@ -449,9 +492,9 @@ class CoverageDirector(object):
 
             # evaluate coverage
             if not coverage.nodes:
-                errors.append(CoverageMappingAbsent(coverage))
+                errors[CoverageMappingAbsent].append(CoverageMappingAbsent(coverage))
             elif coverage.suspicious:
-                errors.append(CoverageMappingSuspicious(coverage))
+                errors[CoverageMappingSuspicious].append(CoverageMappingSuspicious(coverage))
 
             # add the newly created coverage to the list of coverage to be returned
             all_coverage.append(coverage)
@@ -475,30 +518,51 @@ class CoverageDirector(object):
         """
         Internal routine to extract relevant coverage data from a CoverageFile.
         """
-        imagebase = self.metadata.imagebase
+        database_target = self.metadata.filename
+        target_names = [database_target] + self._target_whitelist
 
         #
-        # inspect the coverage file and extract the module name that seems
-        # to match the executable loaded by the disassembler (fuzzy lookup)
+        # inspect the coverage file and extract the module name that seems to
+        # match the executable loaded by the disassembler (fuzzy lookup) or
+        # otherwise aliased by the user through the fallback dialog
         #
 
-        module_name = self._find_fuzzy_name(coverage_file, self.metadata.filename)
+        for name in target_names:
+            module_name = self._find_fuzzy_name(coverage_file, name)
+            if module_name:
+                break
 
         #
-        # TODO/BAILOUT
+        # if the fuzzy name lookup failed and there are named modules in the
+        # coverage file, then we will show them to the user and see if they
+        # can pick out a matching module to load coverage from
         #
 
         if not module_name and coverage_file.modules:
-            logger.debug("TODO/BAILOUT DIALOG")
-            return []
+
+            #
+            # if the user closes the dialog without selecting a name, there's
+            # nothing we can do for them ...
+            #
+
+            dialog = ModuleSelector(database_target, coverage_file.modules, coverage_file.filepath)
+            if not dialog.exec_():
+                return [] # no coverage data extracted ...
+
+            # the user selected a module name! use that to extract coverage
+            module_name = dialog.selected_name
+            if dialog.remember_alias:
+                self._target_whitelist.append(module_name)
 
         #
         # (module, offset, size) style logs (eg, drcov)
         #
 
+        imagebase = self.metadata.imagebase
+
         try:
             coverage_blocks = coverage_file.get_offset_blocks(module_name)
-            coverage_addresses = [imagebase+offset for s, n in coverage_blocks for offset in xrange(s, s+n)]
+            coverage_addresses = [imagebase+offset for bb_start, bb_len in coverage_blocks for offset in xrange(bb_start, bb_start+bb_len)]
             return coverage_addresses
         except NotImplementedError:
             pass
@@ -509,7 +573,7 @@ class CoverageDirector(object):
 
         try:
             coverage_offsets = coverage_file.get_offsets(module_name)
-            coverage_addresses = map(lambda x: imagebase+x, coverage_offsets)
+            coverage_addresses = [imagebase+offset for offset in coverage_offsets]
             return coverage_addresses
         except NotImplementedError:
             pass
@@ -529,17 +593,27 @@ class CoverageDirector(object):
 
     def _optimize_coverage_data(self, coverage_addresses):
         """
-        Internal routine to optimize raw coverage data to the current metadata.
+        Optimize exploded coverage data to the current metadata cache.
         """
         logger.debug("Optimizing coverage data...")
         addresses = set(coverage_addresses)
 
-        # bucketize coverage addresses
+        # bucketize the exploded coverage addresses
         instructions = addresses & set(self.metadata.instructions)
-        basic_blocks = instructions & self.metadata.nodes.viewkeys()
+        basic_blocks = instructions & viewkeys(self.metadata.nodes)
+
+        if not instructions:
+            logger.debug("No mappable instruction addresses in coverage data")
+            return []
+
+        """
+        #
+        # TODO/LOADING: display undefined/misaligned data somehow?
+        #
+
         unknown = addresses - instructions
 
-        # bucketize the uncategorized addresses
+        # bucketize the uncategorized exploded addresses
         undefined, misaligned = [], []
         for address in unknown:
 
@@ -550,18 +624,15 @@ class CoverageDirector(object):
             # size == 0 (misaligned inst)
             else:
                 misaligned.append(address)
+        """
 
         #
-        # TODO: what if there are no defined instructions?
-        # TODO: display undefined/misaligned data somehow
+        # here we attempt to compute the ratio between basic block addresses,
+        # and instruction addresses in the incoming coverage data.
         #
-
-        if not instructions:
-            logger.debug("No mappable instruction addresses in coverage data")
-            return None
-
-        #
-        # TODO/COMMENT
+        # this will help us determine if the existing instruction data is
+        # sufficient, or whether we need to explode/flatten the basic block
+        # addresses into their respective child instructions
         #
 
         block_ratio = len(basic_blocks) / float(len(instructions))
@@ -570,7 +641,8 @@ class CoverageDirector(object):
 
         #
         # a low basic block to instruction ratio implies the data is probably
-        # from an instruction trace or has been flattened already.
+        # from an instruction trace, or a basic block trace has been flattened
+        # exploded already (eg, a drcov log)
         #
 
         if block_ratio < block_trace_confidence:
@@ -578,15 +650,19 @@ class CoverageDirector(object):
             return list(instructions)
 
         #
-        # take each basic block address, and expand it into a list of
-        # presumably executed instructions
+        # take each basic block address, and explode it into a list of all the
+        # instruction addresses contained within the basic block as determined
+        # by the database metadata cache
+        #
+        # it is *possible* that this may introduce 'inaccurate' paint should
+        # the user provide a basic block trace that crashes mid-block. but
+        # that is not something we can account for in a block trace...
         #
 
-        block_instructions = []
+        block_instructions = set([])
         for address in basic_blocks:
-            block_instructions.extend(list(self.metadata.nodes[address].instructions))
+            block_instructions |= set(self.metadata.nodes[address].instructions)
 
-        # DONE
         logger.debug("Optimized as basic block trace...")
         return list(block_instructions | instructions)
 
@@ -635,26 +711,53 @@ class CoverageDirector(object):
         """
         Return the closest matching module name in the given coverage file.
         """
+        target_name = target_name.lower()
 
-        # attempt lookup using case-insensitive filename
+        #
+        # 1. exact, case-insensitive filename matching
+        #
+
         for module_name in coverage_file.modules:
-            if module_name.lower() in target_name.lower():
+            if target_name == module_name.lower():
                 return module_name
 
         #
-        # no hits yet... let's cleave the extension from the given module
-        # name (if present) and try again
+        # 2. cleave the extension from the target module name (the source)
+        # and try again to see if matches anything in the coverage file
         #
 
-        if "." in target_name:
-            target_name = target_name.split(".")[0]
-
-        # attempt lookup using case-insensitive filename without extension
+        target_name, extension = os.path.splitext(target_name)
         for module_name in coverage_file.modules:
-            if module_name.lower() in target_name.lower():
+            if target_name == module_name.lower():
                 return module_name
 
-        return None
+        # too risky to do fuzzy matching on short names...
+        if len(target_name) < 6:
+            return None
+
+        #
+        # 3. try to match *{target_name}*{extension} in module_name, assuming
+        # target_name is more than 6 characters and there is no othe ambiguity
+        #
+
+        possible_names = []
+        for module_name in coverage_file.modules:
+            if target_name in module_name.lower() and extension in module_name.lower():
+                possible_names.append(module_name)
+
+        # there were no matches on the wildcarding, so we're done
+        if not possible_names:
+            return None
+
+        #
+        # if there is multiple potential matches it is too risky to pick one,
+        # so we are not going to return anything as a viable match
+        #
+
+        if len(possible_names) > 1:
+            return None
+
+        return possible_names[0]
 
     #----------------------------------------------------------------------
     # Coverage Management
@@ -725,7 +828,7 @@ class CoverageDirector(object):
 
         # create a new database coverage mapping from the given coverage data
         new_coverage = DatabaseCoverage(
-            self._palette,
+            self.palette,
             coverage_name,
             coverage_filepath,
             coverage_data
@@ -840,7 +943,7 @@ class CoverageDirector(object):
         # TODO/FUTURE: check if there's any references to the coverage aggregate?
 
         # assign a new, blank aggregate set
-        self._special_coverage[AGGREGATE] = DatabaseCoverage(self._palette, AGGREGATE)
+        self._special_coverage[AGGREGATE] = DatabaseCoverage(self.palette, AGGREGATE)
         self._refresh_aggregate() # probably not needed
 
     def get_coverage(self, name):
@@ -860,7 +963,7 @@ class CoverageDirector(object):
         # could not locate coverage
         return None
 
-    def get_coverage_string(self, coverage_name, color=False):
+    def get_coverage_string(self, coverage_name):
         """
         Retrieve a detailed coverage string for the given coverage_name.
         """
@@ -881,24 +984,13 @@ class CoverageDirector(object):
         #   eg: 'A - 73.45% - drcov.boombox.exe.03820.0000.proc.log'
         #
 
-        if color:
-
-            # color the symbol token like the shell
-            symbol = color_text(symbol, self._palette.coverage_token)
-
-            # low coverage color
-            if percent < 30.0:
-                percent_str = color_text(percent_str, self._palette.coverage_bad)
-
-            # okay coverage color
-            elif percent < 60.0:
-                percent_str = color_text(percent_str, self._palette.coverage_okay)
-
-            # good coverage color
-            else:
-                percent_str = color_text(percent_str, self._palette.coverage_good)
-
         return "%s - %s%% - %s" % (symbol, percent_str, coverage_name)
+
+    def dump_unmapped(self):
+        """
+        Dump the unmapped coverage data for the active set.
+        """
+        self.coverage.dump_unmapped()
 
     #----------------------------------------------------------------------
     # Aliases
@@ -1093,7 +1185,7 @@ class CoverageDirector(object):
 
         # if the AST is effectively 'null', return a blank coverage set
         if isinstance(ast, TokenNull):
-            return DatabaseCoverage(self._palette)
+            return DatabaseCoverage(self.palette)
 
         #
         # the director's composition evaluation code (this function) is most
@@ -1231,20 +1323,11 @@ class CoverageDirector(object):
             # we use the mask to generate a new DatabaseCoverage mapping.
             #
 
-            new_composition = DatabaseCoverage(self._palette, data=coverage_mask)
+            new_composition = DatabaseCoverage(self.palette, data=coverage_mask)
 
             # cache & return the newly computed composition
             self._composition_cache[composition_hash] = new_composition
             return new_composition
-
-        #
-        # if the current AST node is a coverage range, we need to evaluate the
-        # range expression. this will produce an aggregate coverage set
-        # described by the start/end of the range (eg, 'A,D')
-        #
-
-        elif isinstance(node, TokenCoverageRange):
-            return self._evaluate_coverage_range(node)
 
         #
         # if the current AST node is a coverage token, we need simply need to
@@ -1269,27 +1352,6 @@ class CoverageDirector(object):
         assert isinstance(coverage_token, TokenCoverageSingle)
         return self.get_coverage(self._alias2name[coverage_token.symbol])
 
-    def _evaluate_coverage_range(self, range_token):
-        """
-        Evaluate a TokenCoverageRange AST token.
-
-        Returns a new aggregate database coverage mapping.
-        """
-        assert isinstance(range_token, TokenCoverageRange)
-
-        # initialize output to a null coverage set
-        output = DatabaseCoverage(self._palette)
-
-        # expand 'A,Z' to ['A', 'B', 'C', ... , 'Z']
-        symbols = [chr(x) for x in range(ord(range_token.symbol_start), ord(range_token.symbol_end) + 1)]
-
-        # build a coverage aggregate described by the range of shorthand symbols
-        for symbol in symbols:
-            output.add_data(self.get_coverage(self._alias2name[symbol]).data)
-
-        # return the computed coverage
-        return output
-
     #----------------------------------------------------------------------
     # Refresh
     #----------------------------------------------------------------------
@@ -1298,13 +1360,63 @@ class CoverageDirector(object):
         """
         Complete refresh of the director and mapped coverage.
         """
-        logger.debug("Refreshing the CoverageDirector")
+        if disassembler[self.metadata.lctx].busy:
+            disassembler.warning("Cannot refresh Lighthouse while the disassembler is busy...")
+            return
 
-        # (re)build our metadata cache of the underlying database
-        self.metadata.refresh()
+        disassembler.show_wait_box("Refreshing Lighthouse...")
+        self._refresh()
+        disassembler.hide_wait_box()
 
-        # (re)map each set of loaded coverage data to the database
-        self._refresh_database_coverage()
+    @catch_errors
+    def _refresh(self):
+        """
+        Internal refresh routine, wrapped to help catch bugs for now.
+        """
+
+        #
+        # (re) build our metadata cache of the underlying database
+        #
+
+        if not is_mainthread():
+            self.metadata.refresh(metadata_progress)
+
+        #
+        # NOTE: optionally, we call the async vesrion here so that we do not pin
+        # the mainthread for disassemblers that will primarily read from the
+        # database in a background thread (eg, Binja)
+        #
+        # for example, this refresh action may be called from a UI event or
+        # clicking 'Open Coverage Overview' (eg, the mainthread). if we pin
+        # the mainthread while doing database reads from a background thread,
+        # we cannot post UI updates such as progress updates to the user
+        #
+        # using an async refresh allows us to 'softly' spin the main (UI)
+        # thread and get UI updates while the refresh runs
+        #
+
+        else:
+            future = self.metadata.refresh_async(metadata_progress, force=True)
+            self.metadata.go_synchronous()
+            await_future(future)
+
+        # (re) map each set of loaded coverage data to the database
+        if self.coverage_names:
+            self._refresh_database_coverage()
+
+        # notify of full-refresh
+        self._notify_refreshed()
+
+    def refresh_theme(self):
+        """
+        Refresh UI facing elements to reflect the current theme.
+
+        Does not require @disassembler.execute_ui decorator as no Qt is touched.
+        """
+        for coverage in self._database_coverage.values():
+            coverage.refresh_theme()
+        for coverage in self._special_coverage.values():
+            coverage.refresh_theme()
 
     def _refresh_database_coverage(self):
         """

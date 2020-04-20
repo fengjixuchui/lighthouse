@@ -22,46 +22,17 @@ Special thanks to [@0vercl0k](https://twitter.com/0vercl0k) for the inspiration.
 * v0.2 -- Multifile support, performance improvements, bugfixes.
 * v0.1 -- Initial release
 
-# IDA Pro Installation
+# Installation
 
-Lighthouse is a cross-platform (Windows, macOS, Linux) python plugin, supporting IDA Pro 6.8 and newer.
+Lighthouse is a cross-platform (Windows, macOS, Linux) python plugin. It takes zero third party dependencies, making the code both portable and easy to install.
 
-- Copy the contents of the `plugin` folder to the IDA plugins folder
-    - On Windows, the folder is at `C:\Program Files (x86)\IDA 6.8\plugins`
-    - On macOS, the folder is at `/Applications/IDA\ Pro\ 6.8/idaq.app/Contents/MacOS/plugins`
-    - On Linux, the folder may be at `/opt/IDA/plugins/`
+1. From your disassembler's python console, run the following command to find its plugin directory:
+   - **IDA Pro**: `os.path.join(idaapi.get_user_idadir(), "plugins")`
+   - **Binary Ninja**: `binaryninja.user_plugin_path()`
 
-It has been primarily developed and tested on Windows, so that is where we expect the best experience.
+2. Copy the contents of this repository's `/plugin/` folder to the listed directory.
 
-# Binary Ninja Installation (Experimental)
-
-At this time, support for Binary Ninja is considered experimental. Please feel free to report any bugs that you encounter.
-
-You can install Lighthouse & PyQt5 for Binary Ninja by following the instructions below.
-
-## Windows Installation
-
-1. Install PyQt5 from a Windows command prompt with the following command:
-
-```
-pip install --target="%appdata%\Binary Ninja\plugins\Lib\site-packages" python-qt5
-```
-
-2. Copy the contents of the `/plugin/` folder in this repo to your Binary Ninja [plugins folder](https://docs.binary.ninja/guide/plugins/index.html#using-plugins).
-
-## Linux Installation
-
-1. Install PyQt5 from a Linux shell with the following command:
-
-```
-sudo apt install python-pyqt5
-```
-
-2. Copy the contents of the `/plugin/` folder in this repo to your Binary Ninja [plugins folder](https://docs.binary.ninja/guide/plugins/index.html#using-plugins).
-
-## macOS Installation
-
-¯\\\_(ツ)\_/¯
+This project is primarily developed and tested with IDA for Windows, so that is where we expect the best experience. Support for Binary Ninja and other disassemblers is still considered exprimental at this time.
 
 # Usage
 
@@ -71,7 +42,7 @@ Lighthouse loads automatically when a database is opened, installing a handful o
 <img alt="Lighthouse Menu Entries" src="screenshots/open.gif"/>
 </p>
 
-These are the entry points for a user to load and view coverage data.
+These are the entry points for a user to load and view coverage data. To generate coverage data that can be loaded into Lighthouse, please look at the [README](https://github.com/gaasedelen/lighthouse/tree/develop/coverage) in the coverage directory of this repository.
 
 ## Coverage Painting
 
@@ -120,7 +91,6 @@ Coverage composition, or _Composing_ as demonstrated above is achieved through a
 ### Grammar Tokens
 * Logical Operators: `|, &, ^, -`
 * Coverage Symbol: `A, B, C, ..., Z`
-* Coverage Range: `A,C`, `Q,Z`, ...
 * Parenthesis: `(...)`
 
 ### Example Compositions
@@ -175,44 +145,6 @@ A sample report can be seen [here](https://rawgit.com/gaasedelen/lighthouse/mast
 <img alt="Lighthouse HTML Report" src="screenshots/html_report.gif"/>
 </p>
 
-# Collecting Coverage
-
-Before using Lighthouse, one will need to collect code coverage data for their target binary / application.
-
-The examples below demonstrate how one can use [DynamoRIO](http://www.dynamorio.org), [Intel Pin](https://software.intel.com/en-us/articles/pin-a-dynamic-binary-instrumentation-tool) or [Frida](https://www.frida.re) to collect Lighthouse compatible coverage against a target. The `.log` files produced by these instrumentation tools can be loaded directly into Lighthouse.
-
-## DynamoRIO
-
-Code coverage data can be collected via DynamoRIO's [drcov](http://dynamorio.org/docs/page_drcov.html) code coverage module. 
-
-Example usage:
-
-```
-..\DynamoRIO-Windows-7.0.0-RC1\bin64\drrun.exe -t drcov -- boombox.exe
-```
-
-## Intel Pin
-
-Using a [custom pintool](coverage/pin) contributed by [Agustin Gianni](https://twitter.com/agustingianni), the Intel Pin DBI can also be used to collect coverage data.
-
-Example usage:
-
-```
-pin.exe -t CodeCoverage64.dll -- boombox.exe
-```
-
-For convenience, binaries for the Windows pintool can be found on the [releases](https://github.com/gaasedelen/lighthouse/releases) page. macOS and Linux users need to compile the pintool themselves following the [instructions](coverage/pin#compilation) included with the pintool for their respective platforms.
-
-## Frida (Experimental)
-
-Lighthouse offers limited support for Frida based code coverage via a custom [instrumentation script](coverage/frida) contributed by [yrp](https://twitter.com/yrp604). 
-
-Example usage:
-
-```
-sudo python frida-drcov.py bb-bench
-```
-
 # Future Work
 
 Time and motivation permitting, future work may include:
@@ -223,11 +155,11 @@ Time and motivation permitting, future work may include:
 * Coverage & profiling treemaps
 * ~~Additional coverage sources, trace formats, etc~~
 * Improved pseudocode painting
-* Lighthouse console access, headless usage
-* Custom themes
-* Python 3 support
+* ~~Lighthouse console access~~, headless usage
+* ~~Custom themes~~
+* ~~Python 3 support~~
 
-I welcome external contributions, issues, and feature requests.
+I welcome external contributions, issues, and feature requests. Please make any pull requests to the `develop` branch of this repo.
 
 # Authors
 

@@ -2,8 +2,10 @@ import os
 import logging
 
 import idaapi
-from lighthouse.core import Lighthouse
+
+from lighthouse.context import LighthouseContext
 from lighthouse.util.misc import plugin_resource
+from lighthouse.integration.core import LighthouseCore
 
 logger = logging.getLogger("Lighthouse.IDA.Integration")
 
@@ -11,7 +13,7 @@ logger = logging.getLogger("Lighthouse.IDA.Integration")
 # Lighthouse IDA Integration
 #------------------------------------------------------------------------------
 
-class LighthouseIDA(Lighthouse):
+class LighthouseIDA(LighthouseCore):
     """
     Lighthouse UI Integration for IDA Pro.
     """
@@ -30,6 +32,34 @@ class LighthouseIDA(Lighthouse):
         # run initialization
         super(LighthouseIDA, self).__init__()
 
+    def get_context(self, dctx=None, startup=True):
+        """
+        Get the LighthouseContext object for a given database context.
+
+        NOTE: since IDA can only have one binary / IDB open at a time, the
+        dctx (database context) should always be 'None'.
+        """
+        self.palette.warmup()
+
+        #
+        # there should only ever be 'one' disassembler / IDB context at any
+        # time for IDA. but if one does not exist yet, that means this is the
+        # first time the user has interacted with Lighthouse for this session
+        #
+
+        if dctx not in self.lighthouse_contexts:
+
+            # create a new 'context' representing this IDB
+            lctx = LighthouseContext(self, dctx)
+            if startup:
+                lctx.start()
+
+            # save the created ctx for future calls
+            self.lighthouse_contexts[dctx] = lctx
+
+        # return the lighthouse context object for this IDB
+        return self.lighthouse_contexts[dctx]
+
     #--------------------------------------------------------------------------
     # IDA Actions
     #--------------------------------------------------------------------------
@@ -46,7 +76,7 @@ class LighthouseIDA(Lighthouse):
 
         # create a custom IDA icon
         icon_path = plugin_resource(os.path.join("icons", "load.png"))
-        icon_data = str(open(icon_path, "rb").read())
+        icon_data = open(icon_path, "rb").read()
         self._icon_id_file = idaapi.load_custom_icon(data=icon_data)
 
         # describe a custom IDA UI action
@@ -82,7 +112,7 @@ class LighthouseIDA(Lighthouse):
 
         # create a custom IDA icon
         icon_path = plugin_resource(os.path.join("icons", "batch.png"))
-        icon_data = str(open(icon_path, "rb").read())
+        icon_data = open(icon_path, "rb").read()
         self._icon_id_batch = idaapi.load_custom_icon(data=icon_data)
 
         # describe a custom IDA UI action
@@ -118,7 +148,7 @@ class LighthouseIDA(Lighthouse):
 
         # create a custom IDA icon
         icon_path = plugin_resource(os.path.join("icons", "batch.png"))
-        icon_data = str(open(icon_path, "rb").read())
+        icon_data = open(icon_path, "rb").read()
         self._icon_id_xref = idaapi.load_custom_icon(data=icon_data)
 
         # describe a custom IDA UI action
@@ -137,7 +167,7 @@ class LighthouseIDA(Lighthouse):
             RuntimeError("Failed to register coverage_xref action with IDA")
 
         self._ui_hooks.hook()
-        logger.info("Installed the 'Code coverage batch' menu entry")
+        logger.info("Installed the 'Coverage Xref' menu entry")
 
     def _install_open_coverage_overview(self):
         """
@@ -146,7 +176,7 @@ class LighthouseIDA(Lighthouse):
 
         # create a custom IDA icon
         icon_path = plugin_resource(os.path.join("icons", "overview.png"))
-        icon_data = str(open(icon_path, "rb").read())
+        icon_data = open(icon_path, "rb").read()
         self._icon_id_overview = idaapi.load_custom_icon(data=icon_data)
 
         # describe a custom IDA UI action
@@ -333,14 +363,23 @@ class UIHooks(idaapi.UI_Hooks):
 
     def finish_populating_widget_popup(self, widget, popup):
         """
-        A right click menu is about to be shown. (IDA 7)
+        A right click menu is about to be shown. (IDA 7.0+)
         """
-        self.integration._inject_ctx_actions(widget, popup, idaapi.get_widget_type(widget))
+
+        #
+        # if lighthouse hasn't been used yet, there's nothing to do. we also
+        # don't want this event to trigger the creation of a lighthouse
+        # context! so we should bail early in this case...
+        #
+
+        if not self.integration.lighthouse_contexts:
+            return 0
+
+        # inject any of lighthouse's right click context menu's into IDA
+        lctx = self.integration.get_context(None)
+        if lctx.director.coverage_names:
+            self.integration._inject_ctx_actions(widget, popup, idaapi.get_widget_type(widget))
+
+        # must return 0 for ida...
         return 0
 
-    def finish_populating_tform_popup(self, form, popup):
-        """
-        A right click menu is about to be shown. (IDA 6.x) / COMPAT
-        """
-        self.integration._inject_ctx_actions(form, popup, idaapi.get_tform_type(form))
-        return 0
